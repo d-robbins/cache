@@ -46,85 +46,114 @@ type Process struct {
 	writes_      uint16
 }
 
+// Remove an element from either the free frame list or used frame list
+// list = "ff" for free frame
+// list = "uf" for used frame
+func (p *Process) RemoveIndexFromFrameList(list string, index int) {
+	var list_ []uint16
+
+	if list == "ff" {
+		list_ = p.free_frames_
+	} else if list == "uf" {
+		list_ = p.used_frames_
+	}
+
+	if index == 0 {
+		list_ = list_[1:]
+	} else if index == len(list_)-1 {
+		list_ = list_[0 : len(list_)-1]
+	} else {
+		lhs := list_[0:(index - 1)]
+		rhs := list_[(index + 1):]
+		for _, x := range rhs {
+			lhs = append(lhs, x)
+		}
+		list_ = lhs
+	}
+
+	if list == "ff" {
+		p.free_frames_ = list_
+	} else if list == "uf" {
+		p.used_frames_ = list_
+	}
+
+}
+
+func (p *Process) LRU(page uint8) (b bool, cp *PageEntry) {
+	b = false
+	j := 0
+	// LRU
+	if len(p.free_frames_) == 0 {
+		// Pick a frame to evict
+		for i, curr_page := range p.table_.entries_ {
+			if curr_page.present_ {
+				// Sorry bud youre the one
+				if curr_page.mod_ {
+					b = true
+				}
+
+				p.free_frames_ = append(p.free_frames_, curr_page.frame_)
+
+				to_remove := 0
+				for i, find_frame := range p.used_frames_ {
+					if find_frame == curr_page.frame_ {
+						to_remove = i
+					}
+				}
+
+				p.RemoveIndexFromFrameList("uf", to_remove)
+				j = i
+				break
+			}
+		}
+
+	}
+
+	// Make sure the replacement worked
+	if len(p.free_frames_) != 0 {
+		p.table_.entries_[page].present_ = true
+		p.table_.entries_[page].ref_ = false
+		p.table_.entries_[page].mod_ = false
+
+		p.table_.entries_[page].frame_ = p.free_frames_[0]
+		p.used_frames_ = append(p.used_frames_, p.free_frames_[0])
+
+		to_remove := 0
+		for i, find_frame := range p.free_frames_ {
+			if find_frame == p.table_.entries_[page].frame_ {
+				to_remove = i
+			}
+		}
+
+		p.RemoveIndexFromFrameList("ff", to_remove)
+
+	} else {
+		fmt.Println("ERROR IN LRU")
+	}
+
+	cp = &p.table_.entries_[j]
+
+	return b, cp
+}
+
 func (p *Process) ProcessReferences() {
 	for _, reference := range p.refs_.refs_ {
+		var f, b bool
+		var fs, bs string
 		page, offset := reference.DecompVirtualAddress()
 		if page >= uint8(PAGE_SIZE) {
 			fmt.Printf("Reference %.4X accessing invalid page: %d", reference.address_, page)
 		} else {
 			present_ready := p.table_.entries_[page].present_
 			for !present_ready {
-				// LRU
-				if len(p.free_frames_) == 0 {
-					// Pick a frame to evict
-					for _, curr_page := range p.table_.entries_ {
-						if curr_page.present_ {
-							// Sorry bud youre the one
-							if curr_page.mod_ {
-								fmt.Println("WRITE BACK")
-							}
-							p.free_frames_ = append(p.free_frames_, curr_page.frame_)
-
-							to_remove := 0
-							for i, find_frame := range p.used_frames_ {
-								if find_frame == curr_page.frame_ {
-									to_remove = i
-								}
-							}
-
-							if to_remove == 0 {
-								p.used_frames_ = p.used_frames_[1:]
-							} else if to_remove == len(p.used_frames_)-1 {
-								p.used_frames_ = p.used_frames_[0 : len(p.used_frames_)-1]
-							} else {
-								lhs := p.used_frames_[0:(to_remove - 1)]
-								rhs := p.used_frames_[(to_remove + 1):]
-								for _, x := range rhs {
-									lhs = append(lhs, x)
-								}
-								p.used_frames_ = lhs
-							}
-
-							fmt.Println("HELLO")
-
-							break
-						}
-					}
-
-				}
-
-				if len(p.free_frames_) != 0 {
-					p.table_.entries_[page].present_ = true
-					p.table_.entries_[page].ref_ = false
-					p.table_.entries_[page].mod_ = false
-
-					p.table_.entries_[page].frame_ = p.free_frames_[0]
-					p.used_frames_ = append(p.used_frames_, p.free_frames_[0])
-
-					to_remove := 0
-					for i, find_frame := range p.free_frames_ {
-						if find_frame == p.table_.entries_[page].frame_ {
-							to_remove = i
-						}
-					}
-
-					if to_remove == 0 {
-						p.free_frames_ = p.free_frames_[1:]
-					} else if to_remove == len(p.free_frames_)-1 {
-						p.free_frames_ = p.free_frames_[0 : len(p.free_frames_)-1]
-					} else {
-						lhs := p.free_frames_[0:(to_remove - 1)]
-						rhs := p.free_frames_[(to_remove + 1):]
-						for _, x := range rhs {
-							lhs = append(lhs, x)
-						}
-						p.free_frames_ = lhs
-					}
-				} else {
-					fmt.Println("ERROR IN LRU")
-				}
-
+				bval, removed := p.LRU(page)
 				present_ready = p.table_.entries_[page].present_
+				f = true
+				b = bval
+				removed.frame_ = 0x0000
+				removed.mod_ = false
+				removed.ref_ = false
+				removed.present_ = false
 			}
 
 			if reference.op_ == "R" {
@@ -135,7 +164,20 @@ func (p *Process) ProcessReferences() {
 			}
 
 			physical := (uint32(p.table_.entries_[page].frame_) << 13) | uint32(offset)
-			fmt.Printf("%.4X %s %.1X    %.6X\n", reference.address_, reference.op_, page, physical)
+
+			if f {
+				fs = "F"
+			} else {
+				fs = " "
+			}
+			if b {
+				bs = "B"
+			} else {
+				bs = " "
+			}
+
+			fmt.Printf("%.4X %s %.1X %s %s %.6X\n", reference.address_, reference.op_, page, fs, bs, physical)
+			p.table_.PrintTable()
 		}
 	}
 }
@@ -266,7 +308,4 @@ func main() {
 	process.refs_.LoadReferences("refs", 10)
 
 	process.ProcessReferences()
-
-	process.table_.PrintTable()
-	process.refs_.PrintReferences()
 }
